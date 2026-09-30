@@ -3,3 +3,6 @@ node_modules/
 .DS_Store
 __pycache__/
 *.pyc
+
+# runtime copy of src/ that deploy/start.sh creates in the workspace (PROXY_RUN_DIR)
+/proxy/
