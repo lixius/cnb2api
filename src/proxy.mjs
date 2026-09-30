@@ -43,7 +43,7 @@ export async function forward({ reqId, payload, wantStream, res, transform }) {
     const t = await up.text().catch(() => '');
     log.warn(reqId, 'upstream error', { status: up.status, preview: t.slice(0, 200) });
     recordUsage({ errors: 1 }); // 上游 HTTP 错误（配额耗尽 402/网关 5xx 等）计入 errors
-    return { handled: false, status: up.status, body: safeJsonOrText(t) };
+    return { handled: false, status: up.status, body: normalizeError(up.status, safeJsonOrText(t)) };
   }
 
   if (wantStream) {
@@ -164,4 +164,21 @@ export async function forward({ reqId, payload, wantStream, res, transform }) {
 
 function safeJsonOrText(t) {
   try { return JSON.parse(t); } catch { return { error: { message: t.slice(0, 500) || 'upstream error' } }; }
+}
+
+// 上游错误体 → OpenAI `{error:{...}}` 形态。
+// ai-ide 网关用 `{code, msg, displayMsg}`（如 11102 模型不可用），原样透传客户端读不懂，
+// /v1/messages 路径也取不到 message。已是 OpenAI 形态的体原样保留。
+function normalizeError(status, body) {
+  if (!body || typeof body !== 'object') {
+    return { error: { message: String(body ?? `upstream error (HTTP ${status})`) } };
+  }
+  if (body.error && typeof body.error === 'object') return body; // 已经是 OpenAI 形态
+  const message = body.msg || body.error_msg || body.message;
+  if (typeof message !== 'string') return body;
+  const type = status === 429 ? 'rate_limit_error'
+    : status === 401 || status === 403 ? 'authentication_error'
+    : status >= 500 ? 'api_error'
+    : 'invalid_request_error';
+  return { error: { message, type, ...(body.code !== undefined ? { code: body.code } : {}) } };
 }

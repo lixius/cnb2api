@@ -45,7 +45,7 @@ client ──https://ai.example.com/v1──▶ fixed domain (your relay / nginx
                           node src/server.mjs   (this proxy, in the workspace)
                                         │  Bearer CNB_TOKEN, CNB-internal only
                                         ▼
-       https://api.cnb.cool/<org>/<repo>/-/ai/chat/completions   (CNB AI endpoint)
+       https://api.cnb.cool/<org>/<repo>/-/ai-ide/v2/chat/completions   (CNB AI gateway)
 ```
 
 `ai.example.com`, `<org>/<repo>`, and port `9001` are **placeholders** — set them
@@ -90,6 +90,13 @@ extra infrastructure. Design details: [docs/DESIGN.md](docs/DESIGN.md).
 
 - **OpenAI-compatible** — `/v1/chat/completions` (streaming SSE + non-streaming),
   `/v1/models`, `/health`. Native **function/tool calls** pass through untouched.
+- **Live model catalog** — `/v1/models` reflects the models the CNB gateway can
+  really route to (33 on our account: GLM, Kimi, DeepSeek, MiniMax, Hunyuan, Step),
+  with context length, capability flags and `credits` multipliers. No hand-kept
+  list; it degrades to `PROXY_MODELS` if the catalog fetch fails.
+- **Real multi-model routing** — the requested `model` is routed to that vendor's
+  backend instead of being ignored by the gateway. Unknown ids are rejected with
+  a clear `11102 model service info not found`.
 - **Anthropic-compatible too** — `/v1/messages` (+`/v1/messages/count_tokens`)
   speaks the Anthropic Messages protocol, so **Claude Code connects directly**:
   set `ANTHROPIC_BASE_URL` and go. Request/response translation covers system
@@ -160,21 +167,41 @@ window; the keepalive loop brings them straight back.
 
 ## Models
 
-`/v1/models` advertises whatever you set in `PROXY_MODELS`. On our account the
-CNB gateway currently exposes three ids — and routes all of them to one upstream
-model today:
+`/v1/models` needs **no maintenance**: it reads the CNB gateway's product config
+(`<repo>/-/ai-ide/v3/config` — the same payload the CodeBuddy client uses to build
+its model picker), normalizes `data.models` into OpenAI model objects, fetches once
+at boot and refreshes on a TTL in the background. On our account that is **33
+models** across GLM, Kimi, DeepSeek, MiniMax, Hunyuan and Step, each carrying
+`context_length`, `max_output_tokens`, a `credits` multiplier and
+`supports_tool_call` / `supports_images` / `supports_reasoning` flags.
 
-| Model id | Notes |
-|---|---|
-| `deepseek-v4-flash` | The model that actually answers today. |
-| `glm-5.3-flash` | Accepted, but routed to `deepseek-v4-flash` (the response's `model` field confirms it). |
-| `kimi-k3` | Same — currently routed to `deepseek-v4-flash`. |
+### Why `/-/ai-ide` and not `/-/ai`
 
-The extra names exist for client compatibility. Set `PROXY_MODELS` to whatever
-your own account exposes. Streaming and non-streaming requests, full `usage`
-aggregation (including `credit`), and native `tools` calls are all verified
-working against the live endpoint. Context-window limits are set by the upstream
-and undocumented, so we don't quote a number we can't verify.
+CNB has **two** AI upstreams and they behave completely differently — the easiest
+trap in this project:
+
+| Upstream | Path | Behaviour |
+|---|---|---|
+| **ai-ide** (default) | `/-/ai-ide/v2/chat/completions` | The CodeBuddy gateway. Validates `model` and routes to that vendor; unknown ids are rejected. |
+| workspace | `/-/ai/chat/completions` | Pinned to one model. **Ignores the request's `model`** — even a bogus id returns 200 from that single backend. |
+
+Earlier versions pointed at the workspace endpoint, which is why every id returned
+the same model. The default is now ai-ide; set `UPSTREAM_KIND=workspace` for the
+old behaviour.
+
+Measured side by side (same "name your model and vendor" prompt):
+
+| Requested `model` | ai-ide (default) | workspace |
+|---|---|---|
+| `glm-5.3-flash` | `GLM` / `Z.ai` | `DeepSeek-V3` / `DeepSeek` |
+| `kimi-k3-2` | `Kimi` / `Moonshot AI` | still that same backend |
+| `step-5-preview` | `Step` / `StepFun` | still that same backend |
+| `bogus-model-xyz` | HTTP 400 `11102 model service info not found` | HTTP 200, silently served by the pinned backend |
+
+Streaming and non-streaming requests, full `usage` aggregation (including
+`credit`), and native `tools` calls are all verified working against the live
+endpoint. Context windows come from the `context_length` field in `/v1/models`,
+which is sourced from the platform config.
 
 ## Use it anywhere
 
@@ -260,14 +287,21 @@ curl http://127.0.0.1:9001/v1/chat/completions \
 | `PROXY_KEY` | — (required) | Bearer key clients must send. No default; refuses to start if missing. |
 | `CNB_TOKEN` | — (required) | Upstream token; injected by the CNB pipeline stage. |
 | `CNB_REPO_SLUG` | (built-in) | `org/repo` used to build the upstream URL. A built-in CNB variable, auto-filled inside every pipeline. |
-| `PROXY_MODELS` | `deepseek-v4-flash,glm-5.3-flash,kimi-k3` | Comma-separated ids advertised on `/v1/models`. |
+| `UPSTREAM_KIND` | `ide` | `ide` = `/-/ai-ide/v2/chat/completions` (real multi-model routing); `workspace` = `/-/ai/chat/completions` (single model, ignores `model`). |
+| `PROXY_MODELS` | `deepseek-v4.1-flash,glm-5.3-flash,kimi-k3-2` | **Fallback** list: used by `/v1/models` before the catalog loads and whenever the fetch fails. |
+| `PROXY_MODELS_DYNAMIC` | `1` | Fetch the live catalog from CNB; set `0` to serve only `PROXY_MODELS`. |
+| `PROXY_MODELS_URL` | `<repo>/-/ai-ide/v3/config` | Catalog endpoint; rarely needs changing. |
+| `PROXY_MODELS_TTL_MS` | `3600000` | Background catalog refresh interval. |
+| `PROXY_MODELS_TIMEOUT_MS` | `8000` | Catalog fetch timeout. |
+| `PROXY_MODELS_WAIT_MS` | `1500` | How long one request may wait on a cold cache before falling back. |
+| `CODEBUDDY_VERSION` | `2.160.0` | CodeBuddy UA version the catalog endpoint requires (need not be a real release). |
 | `PROXY_PORT` | `9001` | Listen port. |
 | `PROXY_UPSTREAM_TIMEOUT_MS` | `15000` | Upstream connect / first-byte timeout. |
 | `PROXY_IDLE_TIMEOUT_MS` | `300000` | Per-stream idle watchdog. |
 | `REGISTER_URL` | — (optional) | Relay `/ops/register` endpoint for self-registration. |
 | `REG_TOKEN` | — (optional) | Shared secret for self-registration. |
 | `QUOTA_ORG` | — (optional) | Org for the quota CLI when it differs from `CNB_REPO_SLUG`. |
-| `UPSTREAM_OVERRIDE` | — | Test-only: point the upstream at a local mock. |
+| `UPSTREAM_OVERRIDE` | — | Test-only: point the upstream at a local mock (also disables the catalog fetch by default). |
 
 ## FAQ
 

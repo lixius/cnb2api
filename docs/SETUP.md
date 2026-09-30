@@ -51,11 +51,11 @@ the secrets-repo flow below — delete the inline `env:` line, uncomment
 
 - A [cnb.cool](https://cnb.cool) account whose org has **AI credits** enabled
   (the "天才程序员" / built-in AI offering). Without it the upstream endpoint
-  `https://api.cnb.cool/<org>/<repo>/-/ai/chat/completions` returns errors.
-- Know which models your account exposes. Set `PROXY_MODELS` to that list —
-  the repo default is `deepseek-v4-flash,glm-5.3-flash,kimi-k3` (what our
-  account advertises; the gateway currently routes all three to the same
-  upstream model) and requests naming an unavailable model will be rejected.
+  `https://api.cnb.cool/<org>/<repo>/-/ai-ide/v2/chat/completions` returns errors.
+- **You do not need to know your model list.** By default the proxy reads the CNB
+  gateway's live catalog and serves it on `/v1/models`, so clients see exactly what
+  your account can route to. `PROXY_MODELS` is only a fallback for when that fetch
+  fails (default `deepseek-v4.1-flash,glm-5.3-flash,kimi-k3-2`).
 
 **Quota & compute economics** (measured on our deployment):
 - **Compute**: a workspace pinned at `runner.cpus: 2` burns 48 core-hours/day;

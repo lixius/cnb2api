@@ -40,7 +40,7 @@ client ──https://ai.example.com/v1──▶ 固定域名(自建 relay / ngin
                           node src/server.mjs   (本代理,跑在工作区里)
                                         │  Bearer CNB_TOKEN,仅 CNB 内网可达
                                         ▼
-       https://api.cnb.cool/<org>/<repo>/-/ai/chat/completions   (CNB AI 端点)
+       https://api.cnb.cool/<org>/<repo>/-/ai-ide/v2/chat/completions   (CNB AI 网关)
 ```
 
 `ai.example.com`、`<org>/<repo>`、端口 `9001` 都是**占位符**——换成你自己的。
@@ -82,6 +82,11 @@ client ──https://ai.example.com/v1──▶ 固定域名(自建 relay / ngin
 
 - **OpenAI 兼容**——`/v1/chat/completions`(流式 SSE + 非流式)、`/v1/models`、
   `/health`。原生**函数/工具调用**原样透传。
+- **实时模型目录**——`/v1/models` 自动反映 CNB 网关真实可用的模型(当前 33 个:
+  GLM / Kimi / DeepSeek / MiniMax / 混元 / Step 等),带上下文长度、能力标记与
+  credits 倍率,不再需要手工维护清单。目录拉取失败时自动降级到 `PROXY_MODELS`。
+- **真·多模型路由**——请求里的 `model` 被如实路由到对应厂商后端,而不是被网关
+  忽略。未知 id 会被明确拒绝(`11102 model service info not found`)。
 - **Anthropic 兼容**——`/v1/messages`(含 `/v1/messages/count_tokens`)完整实现
   Anthropic Messages 协议,**Claude Code 直连**:`ANTHROPIC_BASE_URL` 一设就能用。
   请求/响应翻译覆盖 system 提示(顶级与 messages 内)、text/image/thinking 块、
@@ -143,19 +148,37 @@ credits 约合 **2 亿 tokens/月**。别把任何单一数字当承诺:用下�
 
 ## 模型
 
-`/v1/models` 展示的就是你在 `PROXY_MODELS` 里列的清单。我们账号上,CNB 网关
-当前暴露三个 id——而且当前都路由到同一个上游模型:
+`/v1/models` **不需要手工维护**:它直接读 CNB 网关的产品配置
+(`<repo>/-/ai-ide/v3/config`,也就是 CodeBuddy 客户端用来生成模型下拉框的同一份
+数据),把 `data.models` 归一化成 OpenAI 的 model 对象,启动时拉一次、之后按 TTL
+后台刷新。我们账号上当前是 **33 个**,覆盖 GLM、Kimi、DeepSeek、MiniMax、混元、
+Step 等厂商,每项带 `context_length`、`max_output_tokens`、`credits` 倍率和
+`supports_tool_call` / `supports_images` / `supports_reasoning` 能力标记。
 
-| 模型 id | 说明 |
-|---|---|
-| `deepseek-v4-flash` | 当前实际应答的模型。 |
-| `glm-5.3-flash` | 可作为 id 调用,但被路由到 `deepseek-v4-flash`(响应的 `model` 字段可印证)。 |
-| `kimi-k3` | 同上——当前同样路由到 `deepseek-v4-flash`。 |
+### 为什么是 `/-/ai-ide` 而不是 `/-/ai`
 
-额外的名字只是为了客户端兼容。`PROXY_MODELS` 请按你自己账号实际暴露的清单来
-设。流式与非流式请求、完整 `usage` 聚合(含 `credit`)、原生 `tools` 调用均已
-对线上端点实测验证。上下文窗口由上游决定且官方未文档化,我们不引用无法核实的
-数字。
+CNB 有**两套** AI 端点,行为完全不同——这是本项目最容易踩的坑:
+
+| 上游 | 路径 | 行为 |
+|---|---|---|
+| **ai-ide**(默认) | `/-/ai-ide/v2/chat/completions` | CodeBuddy 产品网关。按 `model` 校验并路由到对应厂商;未知 id 直接拒绝。 |
+| workspace | `/-/ai/chat/completions` | 固定单个模型。**完全忽略请求里的 `model`**——连不存在的 id 也会返回 200,由那一个后端应答。 |
+
+早期版本接的是 workspace 端点,所以无论传什么 id 都只得到同一个模型。默认已切换
+到 ai-ide;需要旧行为时设 `UPSTREAM_KIND=workspace`。
+
+实测对照(同一句"只回答模型名和厂商"):
+
+| 请求的 `model` | ai-ide(默认) | workspace |
+|---|---|---|
+| `glm-5.3-flash` | `GLM` / `Z.ai` | `DeepSeek-V3` / `深度求索` |
+| `kimi-k3-2` | `Kimi` / `月之暗面` | 仍是同一个后端 |
+| `step-5-preview` | `Step` / `阶跃星辰` | 仍是同一个后端 |
+| `bogus-model-xyz` | HTTP 400 `11102 model service info not found` | HTTP 200,静默落到同一后端 |
+
+流式与非流式请求、完整 `usage` 聚合(含 `credit`)、原生 `tools` 调用均已对线上
+端点实测验证。上下文窗口以 `/v1/models` 返回的 `context_length` 为准(该值来自
+平台配置)。
 
 ## 到处都能用
 
@@ -239,14 +262,21 @@ curl http://127.0.0.1:9001/v1/chat/completions \
 | `PROXY_KEY` | —(必填) | 客户端必须携带的 Bearer key。无默认值;缺失拒绝启动。 |
 | `CNB_TOKEN` | —(必填) | 上游令牌;由 CNB 流水线阶段自动注入。 |
 | `CNB_REPO_SLUG` | (内置) | 拼上游 URL 用的 `org/repo`。CNB 内置变量,所有流水线自动填充。 |
-| `PROXY_MODELS` | `deepseek-v4-flash,glm-5.3-flash,kimi-k3` | `/v1/models` 展示的模型 id 列表。 |
+| `UPSTREAM_KIND` | `ide` | `ide`=`/-/ai-ide/v2/chat/completions`(多模型真实路由);`workspace`=`/-/ai/chat/completions`(单模型,忽略 `model`)。 |
+| `PROXY_MODELS` | `deepseek-v4.1-flash,glm-5.3-flash,kimi-k3-2` | **降级用**静态清单:目录未加载或拉取失败时 `/v1/models` 用它。 |
+| `PROXY_MODELS_DYNAMIC` | `1` | 是否从 CNB 拉取实时模型目录;设 `0` 只用 `PROXY_MODELS`。 |
+| `PROXY_MODELS_URL` | `<repo>/-/ai-ide/v3/config` | 模型目录地址,一般不用改。 |
+| `PROXY_MODELS_TTL_MS` | `3600000` | 目录后台刷新间隔。 |
+| `PROXY_MODELS_TIMEOUT_MS` | `8000` | 目录拉取超时。 |
+| `PROXY_MODELS_WAIT_MS` | `1500` | 冷缓存时单个请求最多等多久再降级。 |
+| `CODEBUDDY_VERSION` | `2.160.0` | 目录接口要求的 CodeBuddy UA 版本号(无需是真实版本)。 |
 | `PROXY_PORT` | `9001` | 监听端口。 |
 | `PROXY_UPSTREAM_TIMEOUT_MS` | `15000` | 上游连接 / 首字节超时。 |
 | `PROXY_IDLE_TIMEOUT_MS` | `300000` | 流级空闲看门狗。 |
 | `REGISTER_URL` | —(可选) | 自注册的 relay `/ops/register` 地址。 |
 | `REG_TOKEN` | —(可选) | 自注册共享密钥。 |
 | `QUOTA_ORG` | —(可选) | 额度 CLI 查询的 org,与 `CNB_REPO_SLUG` 不同时使用。 |
-| `UPSTREAM_OVERRIDE` | — | 仅测试:把上游指到本地 mock。 |
+| `UPSTREAM_OVERRIDE` | — | 仅测试:把上游指到本地 mock(同时默认关闭目录拉取)。 |
 
 ## FAQ
 

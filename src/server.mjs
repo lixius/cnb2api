@@ -5,6 +5,7 @@ import { checkAuth } from './auth.mjs';
 import { forward } from './proxy.mjs';
 import { log, newReqId } from './log.mjs';
 import { snapshot as usageSnapshot } from './usage.mjs';
+import * as models from './models.mjs';
 import { fromAnthropicRequest, toAnthropicResponse, AnthropicStream, countTokensEstimate, frame, ProtocolError } from './anthropic.mjs';
 
 function send(res, status, body, extraHeaders = {}) {
@@ -109,7 +110,9 @@ const server = http.createServer(async (req, res) => {
       // 模型列表需要鉴权（key 不对同样计失败）；health 保持免鉴权供探测
       const auth = checkAuth(req);
       if (!auth.ok) return sendAuthFailure(res, auth, reqId, req.url);
-      return send(res, 200, { object: 'list', data: config.models.map((id) => ({ id, object: 'model', owned_by: 'cnb' })) });
+      // 目录来自 ai-ide /v3/config（缓存 + 后台刷新）；冷缓存只等一小会儿就降级
+      const data = await models.ensure();
+      return send(res, 200, { object: 'list', data });
     }
 
     if (req.method === 'POST' && req.url.split('?')[0].endsWith('/chat/completions')) {
@@ -169,8 +172,10 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+models.start(); // 启动即拉一次目录，之后按 TTL 后台刷新（失败不影响服务）
+
 server.listen(config.port, '0.0.0.0', () => {
-  log.info('-', 'listening', { port: config.port, upstream: config.upstreamUrl, models: config.models });
+  log.info('-', 'listening', { port: config.port, upstream: config.upstreamUrl, kind: config.upstreamKind, catalog: models.state() });
 });
 
 for (const sig of ['SIGTERM', 'SIGINT']) {

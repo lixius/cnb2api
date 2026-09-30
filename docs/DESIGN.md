@@ -7,9 +7,18 @@ discoverable, the key is rotatable, the behavior is predictable."
 
 ## 1. Constraints that shape the design
 
-- The CNB AI endpoint (`https://api.cnb.cool/<org>/<repo>/-/ai/chat/completions`)
-  is only reachable from inside CNB's network and needs a pipeline `CNB_TOKEN`.
+- The CNB AI endpoint is only reachable from inside CNB's network and needs a
+  pipeline `CNB_TOKEN`.
   → the proxy **must run inside the workspace**.
+- CNB exposes **two** AI upstreams, and they behave very differently:
+
+  | Upstream | Path | Behaviour |
+  |---|---|---|
+  | ai-ide (default) | `/-/ai-ide/v2/chat/completions` | The CodeBuddy gateway. Validates `model` against a real 33-model catalog and routes to that vendor; unknown ids are rejected with `11102`. |
+  | workspace | `/-/ai/chat/completions` | Pinned to a single model. It **ignores the request's `model` field** — a bogus id still returns HTTP 200 from the pinned backend. |
+
+  → `UPSTREAM_KIND=ide` is the default because it is the only one that can serve
+  more than one model.
 - A CNB workspace subdomain (`<subdomain>-<port>.cnb.run`) **changes on every
   restart**, and the platform force-recycles workspaces (e.g. overnight).
   → any fixed public URL must **follow** the drifting subdomain automatically.
@@ -22,6 +31,7 @@ discoverable, the key is rotatable, the behavior is predictable."
 src/
 ├── config.mjs   env loading + fail-fast validation (no default key, ever)
 ├── auth.mjs     Bearer key check (timing-safe) + sliding-window fail limiter
+├── models.mjs   live model catalog for /v1/models (fetch + cache + fallback)
 ├── sse.mjs      SSE event parsing + non-stream aggregation
 ├── proxy.mjs    upstream forwarding: AbortSignal timeout + two-way cancel
 ├── server.mjs   http server + routing (/health, /v1/models, /v1/chat/completions)
@@ -47,6 +57,20 @@ client ──POST /v1/chat/completions──▶ server.mjs
       merge) / usage / finish_reason → assembled into a full chat.completion
   ⑥ log.mjs: one JSON line {reqId, path, status, ms, tokens}
 ```
+
+`GET /v1/models` does not read a static list: `models.mjs` fetches the ai-ide
+product config (`<repo>/-/ai-ide/v3/config`, the same payload the CodeBuddy client
+uses to build its model picker), normalizes `data.models` to OpenAI model objects
+and caches it. The fetch is kicked off at boot and refreshed on a TTL in the
+background; a request on a cold cache waits at most `PROXY_MODELS_WAIT_MS` before
+falling back. A failed or empty fetch never takes the endpoint down — it keeps
+serving the last good catalog, or the static `PROXY_MODELS` list.
+
+Upstream error bodies are normalized on the way out. The ai-ide gateway reports
+failures as `{code, msg, displayMsg}`, which OpenAI clients (and the Anthropic
+adapter, which reads `error.message`) cannot interpret; `proxy.mjs` rewrites that
+into `{error:{message, type, code}}` while leaving already-OpenAI-shaped bodies
+untouched.
 
 ### Aggregation details
 
@@ -88,6 +112,12 @@ streaming passthrough, non-stream aggregation (content + incremental tool_calls 
 usage + finish_reason), client-abort cancellation, upstream 500 passthrough,
 connect timeout → 504, stream stall → idle watchdog, routing (`/health`,
 `/v1/models`, 404). Run with `node --test`.
+
+`test/models.test.mjs` covers the catalog without touching the network: metadata
+normalization, the required CodeBuddy `User-Agent` on the config request, error
+handling for bad status/shape/URL, and two end-to-end runs against a mock catalog
+(live catalog served on `/v1/models`, and degradation to `PROXY_MODELS` when the
+catalog endpoint fails).
 
 ## 6. Non-goals
 
